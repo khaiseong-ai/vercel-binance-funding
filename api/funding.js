@@ -66,6 +66,13 @@ function buildExchanges() {
       enableRateLimit: true,
       options: { defaultType: 'swap' },
     }),
+    bitget: new ccxt.bitget({
+      apiKey: process.env.BITGET_API_KEY,
+      secret: process.env.BITGET_API_SECRET,
+      password: process.env.BITGET_API_PASSWORD || process.env.BITGET_API_PASSPHRASE,
+      enableRateLimit: true,
+      options: { defaultType: 'swap' },
+    }),
   };
 }
 
@@ -179,11 +186,50 @@ async function fetchMexcEquity(ex) {
   return w;
 }
 
+async function fetchBitgetEquity(ex) {
+  const w = emptyWallet();
+  const [swapBal, spotBal] = await Promise.all([
+    ex.fetchBalance({ type: 'swap' }).catch(() => ({})),
+    ex.fetchBalance({ type: 'spot' }).catch(() => ({})),
+  ]);
+
+  const parseBalanceCoin = (bal, coin) =>
+    num(
+      bal?.total?.[coin] ||
+      bal?.free?.[coin] ||
+      bal?.used?.[coin] ||
+      bal?.[coin]?.total ||
+      bal?.[coin]?.free
+    );
+
+  w.futures.USDT = parseBalanceCoin(swapBal, 'USDT');
+  w.futures.USDC = parseBalanceCoin(swapBal, 'USDC');
+
+  const swapInfo = swapBal?.info?.data;
+  const swapRows = Array.isArray(swapInfo) ? swapInfo : (swapInfo ? [swapInfo] : []);
+  for (const row of swapRows) {
+    const coin = row.marginCoin || row.coin || row.currency;
+    if (coin === 'USDT') {
+      w.futures.USDT = num(row.usdtEquity || row.equity || row.accountEquity || row.marginBalance || row.available);
+    }
+    if (coin === 'USDC') {
+      w.futures.USDC = num(row.usdcEquity || row.equity || row.accountEquity || row.marginBalance || row.available);
+    }
+  }
+
+  w.spot.USDT = parseBalanceCoin(spotBal, 'USDT');
+  w.spot.USDC = parseBalanceCoin(spotBal, 'USDC');
+
+  w.total = sumWallet(w);
+  return w;
+}
+
 const BALANCE_FETCHERS = {
   binance: fetchBinanceEquity,
   phemex: fetchPhemexEquity,
   bybit: fetchBybitEquity,
   mexc: fetchMexcEquity,
+  bitget: fetchBitgetEquity,
 };
 
 // ---------- Ticker ----------
@@ -266,7 +312,7 @@ async function processExchangePositions(name, exchange, nowMs, sinceMs) {
     const totalFunding = allFunding.reduce((s, f) => s + num(f.amount), 0) * signFlip;
 
     let positionSize = pos.contracts;
-    if (name === 'mexc') {
+    if (name === 'mexc' || name === 'bitget') {
       const market = exchange.markets[pos.symbol];
       const contractSize = market?.contractSize || 1;
       positionSize = (pos.contracts || 0) * contractSize;
@@ -317,7 +363,7 @@ function formatOrder(o, name, exchange) {
   // MEXC 合约 amount 是张数 (contracts)；需要 × contractSize 转成币数
   // 保持和 position.positionSize 的换算一致（见 processExchangePositions）
   let amount = num(o.amount || o.info?.origQty || o.info?.quantity || 0);
-  if (name === 'mexc' && exchange && o.symbol) {
+  if ((name === 'mexc' || name === 'bitget') && exchange && o.symbol) {
     const market = exchange.markets?.[o.symbol];
     const contractSize = market?.contractSize;
     if (contractSize && contractSize !== 1) {
@@ -355,7 +401,7 @@ async function processExchangeOrders(name, exchange, positionRows) {
         return [...normal, ...triggers];
       }));
       results.push(...perSymbol.flat().map((o) => formatOrder(o, name, exchange)));
-    } else if (name === 'phemex') {
+    } else if (name === 'phemex' || name === 'bitget') {
       const posSymbols = [...new Set(
         positionRows.filter((p) => p.source === name)
           .map((p) => p.rawSymbol || `${p.symbol}/USDT:USDT`)
