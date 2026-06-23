@@ -1,10 +1,12 @@
 const ccxt = require('ccxt');
 
-const FUNDING_WINDOW_MS = 72.01 * 60 * 60 * 1000;
+const FUNDING_WINDOW_MS = 72 * 60 * 60 * 1000;
 const FUNDING_PAGE_LIMIT = 100;
 const FUNDING_MAX_PAGES = 3;
 const NEGATIVE_FUNDING_SIGN = new Set(['phemex', 'bybit']);
 const COINS = ['USDT', 'USDC'];
+const HOUR_MS = 60 * 60 * 1000;
+const COMMON_FUNDING_INTERVALS = [1, 2, 4, 8, 12, 24];
 
 const toSGTime = (ts) =>
   new Date(ts).toLocaleString('en-SG', { timeZone: 'Asia/Singapore' });
@@ -263,7 +265,125 @@ function computePnL(pos, ticker, positionSize) {
 }
 
 // ---------- Funding ----------
+const parseIntervalHours = (value) => {
+  if (value == null) return 0;
+  if (typeof value === 'number') {
+    if (value > HOUR_MS) return value / HOUR_MS;
+    if (value > 24) return value / 3600;
+    return value;
+  }
+
+  const text = String(value).trim().toLowerCase();
+  const match = text.match(/([\d.]+)\s*(h|hr|hour|m|min|minute)/);
+  if (!match) return parseIntervalHours(num(text));
+  const amount = num(match[1]);
+  return match[2].startsWith('m') ? amount / 60 : amount;
+};
+
+const closestCommonInterval = (hours) => {
+  if (!hours) return 0;
+  let closest = COMMON_FUNDING_INTERVALS[0];
+  for (const candidate of COMMON_FUNDING_INTERVALS) {
+    if (Math.abs(candidate - hours) < Math.abs(closest - hours)) closest = candidate;
+  }
+  return Math.abs(closest - hours) <= Math.max(0.2, closest * 0.15) ? closest : hours;
+};
+
+function inferFundingInterval(records) {
+  const timestamps = [...new Set(
+    records.map((r) => num(r.timestamp)).filter(Boolean)
+  )].sort((a, b) => a - b);
+  if (timestamps.length < 2) return 0;
+
+  const counts = new Map();
+  for (let i = 1; i < timestamps.length; i++) {
+    const hours = closestCommonInterval((timestamps[i] - timestamps[i - 1]) / HOUR_MS);
+    if (hours > 0 && hours <= 24) counts.set(hours, (counts.get(hours) || 0) + 1);
+  }
+  if (!counts.size) return 0;
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0][0];
+}
+
+function fundingIntervalFromRate(rate, market) {
+  const info = rate?.info || {};
+  const marketInfo = market?.info || {};
+  const candidates = [
+    rate?.interval,
+    rate?.fundingInterval,
+    rate?.fundingIntervalHours,
+    info.fundingInterval,
+    info.fundingIntervalHours,
+    info.fundingRateInterval,
+    info.ratePeriod,
+    marketInfo.fundingInterval,
+    marketInfo.fundingIntervalHours,
+    marketInfo.fundingRateInterval,
+  ];
+  for (const value of candidates) {
+    const hours = closestCommonInterval(parseIntervalHours(value));
+    if (hours > 0 && hours <= 24) return hours;
+  }
+  return 0;
+}
+
+async function buildFundingRateCache(exchange, symbols) {
+  if (!symbols.length || !exchange.has?.fetchFundingRates) return {};
+  try {
+    return await exchange.fetchFundingRates(symbols) || {};
+  } catch (err) {
+    console.error(`Funding rate cache: ${err.message}`);
+    return {};
+  }
+}
+
+async function buildFundingIntervalCache(exchange, symbols) {
+  if (!symbols.length) return {};
+  if (exchange.has?.fetchFundingIntervals) {
+    try {
+      return await exchange.fetchFundingIntervals(symbols) || {};
+    } catch (err) {
+      console.error(`Funding interval cache: ${err.message}`);
+    }
+  }
+  if (exchange.has?.fetchFundingInterval) {
+    const entries = await Promise.all(symbols.map(async (symbol) => {
+      try {
+        return [symbol, await exchange.fetchFundingInterval(symbol)];
+      } catch {
+        return [symbol, null];
+      }
+    }));
+    return Object.fromEntries(entries.filter(([, interval]) => interval));
+  }
+  return {};
+}
+
+async function fetchFundingInterval(exchange, symbol) {
+  if (!exchange.has?.fetchFundingInterval) return null;
+  try {
+    return await exchange.fetchFundingInterval(symbol);
+  } catch {
+    return null;
+  }
+}
+
 async function fetchFundingWindow(exchange, symbol, sinceMs, nowMs) {
+  if (exchange.id === 'bitget') {
+    try {
+      const records = await exchange.fetchFundingHistory(
+        symbol,
+        sinceMs,
+        FUNDING_PAGE_LIMIT,
+        { paginate: true, until: nowMs }
+      );
+      return records
+        .filter((record) => record.timestamp >= sinceMs && record.timestamp <= nowMs)
+        .sort((a, b) => b.timestamp - a.timestamp);
+    } catch (err) {
+      console.error(`Bitget funding pagination: ${err.message}`);
+    }
+  }
+
   const seen = new Set();
   const all = [];
   let start = sinceMs;
@@ -289,6 +409,88 @@ async function fetchFundingWindow(exchange, symbol, sinceMs, nowMs) {
 }
 
 // ---------- 持仓 ----------
+async function fetchFundingSchedule(exchange, symbol, sinceMs, nowMs) {
+  if (!exchange.has?.fetchFundingRateHistory) return [];
+
+  const seen = new Set();
+  const all = [];
+  let start = sinceMs;
+
+  for (let i = 0; i < FUNDING_MAX_PAGES; i++) {
+    let page;
+    try {
+      page = await exchange.fetchFundingRateHistory(symbol, start, FUNDING_PAGE_LIMIT);
+    } catch {
+      break;
+    }
+    if (!page?.length) break;
+
+    for (const rate of page) {
+      const timestamp = num(rate.timestamp);
+      if (timestamp >= sinceMs && timestamp <= nowMs && !seen.has(timestamp)) {
+        seen.add(timestamp);
+        all.push({ timestamp });
+      }
+    }
+    const last = num(page[page.length - 1]?.timestamp);
+    if (!last || last <= start || page.length < FUNDING_PAGE_LIMIT) break;
+    start = last + 1;
+  }
+  return all.sort((a, b) => b.timestamp - a.timestamp);
+}
+
+function buildExpectedFundingRecords(
+  records,
+  schedule,
+  intervalHours,
+  anchorTimestamp,
+  sinceMs,
+  nowMs
+) {
+  const intervalMs = intervalHours * HOUR_MS;
+  let expected = schedule.slice();
+
+  if (!expected.length) {
+    if (!intervalMs) return records;
+    let anchor = num(anchorTimestamp);
+    if (!anchor && records.length) anchor = num(records[0].timestamp);
+    if (!anchor) return records;
+    while (anchor > nowMs) anchor -= intervalMs;
+    while (anchor + intervalMs <= nowMs) anchor += intervalMs;
+
+    for (let ts = anchor; ts >= sinceMs; ts -= intervalMs) expected.push({ timestamp: ts });
+    for (let ts = anchor + intervalMs; ts <= nowMs; ts += intervalMs) {
+      expected.push({ timestamp: ts });
+    }
+  }
+
+  const unused = records.slice();
+  const tolerance = intervalMs
+    ? Math.min(30 * 60 * 1000, intervalMs * 0.2)
+    : 15 * 60 * 1000;
+  const merged = expected.sort((a, b) => b.timestamp - a.timestamp).map((slot) => {
+    let bestIndex = -1;
+    let bestDistance = Infinity;
+    for (let i = 0; i < unused.length; i++) {
+      const distance = Math.abs(num(unused[i].timestamp) - slot.timestamp);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = i;
+      }
+    }
+    if (bestIndex >= 0 && bestDistance <= tolerance) {
+      return unused.splice(bestIndex, 1)[0];
+    }
+    return { timestamp: slot.timestamp, amount: 0 };
+  });
+
+  for (const record of unused) {
+    const timestamp = num(record.timestamp);
+    if (timestamp >= sinceMs && timestamp <= nowMs) merged.push(record);
+  }
+  return merged.sort((a, b) => b.timestamp - a.timestamp);
+}
+
 async function processExchangePositions(name, exchange, nowMs, sinceMs) {
   let positions;
   try {
@@ -304,11 +506,59 @@ async function processExchangePositions(name, exchange, nowMs, sinceMs) {
   if (!open.length) return [];
 
   const symbols = [...new Set(open.map((p) => p.symbol))];
-  const tickerCache = await buildTickerCache(exchange, symbols);
+  const [tickerCache, fundingRateCache, fundingIntervalCache] = await Promise.all([
+    buildTickerCache(exchange, symbols),
+    buildFundingRateCache(exchange, symbols),
+    buildFundingIntervalCache(exchange, symbols),
+  ]);
   const signFlip = NEGATIVE_FUNDING_SIGN.has(name) ? -1 : 1;
 
   const rows = await Promise.all(open.map(async (pos) => {
-    const allFunding = await fetchFundingWindow(exchange, pos.symbol, sinceMs, nowMs);
+    const privateFunding = await fetchFundingWindow(exchange, pos.symbol, sinceMs, nowMs);
+    const rate = fundingRateCache[pos.symbol];
+    let intervalData = fundingIntervalCache[pos.symbol];
+    let fundingIntervalHours =
+      fundingIntervalFromRate(intervalData, exchange.markets[pos.symbol]) ||
+      fundingIntervalFromRate(rate, exchange.markets[pos.symbol]) ||
+      inferFundingInterval(privateFunding);
+    let schedule = [];
+
+    if (!fundingIntervalHours) {
+      intervalData = await fetchFundingInterval(exchange, pos.symbol);
+      fundingIntervalHours = fundingIntervalFromRate(
+        intervalData,
+        exchange.markets[pos.symbol]
+      );
+    }
+
+    const nextFundingTimestamp = num(
+      intervalData?.nextFundingTimestamp || rate?.nextFundingTimestamp
+    );
+    const fundingTimestamp = num(
+      intervalData?.fundingTimestamp || rate?.fundingTimestamp
+    );
+
+    if (
+      !fundingIntervalHours ||
+      (!privateFunding.length && !nextFundingTimestamp && !fundingTimestamp)
+    ) {
+      schedule = await fetchFundingSchedule(exchange, pos.symbol, sinceMs, nowMs);
+      if (!fundingIntervalHours) fundingIntervalHours = inferFundingInterval(schedule);
+    }
+
+    const anchorTimestamp =
+      schedule[0]?.timestamp ||
+      (nextFundingTimestamp && fundingIntervalHours
+        ? nextFundingTimestamp - fundingIntervalHours * HOUR_MS
+        : fundingTimestamp);
+    const allFunding = buildExpectedFundingRecords(
+      privateFunding,
+      schedule,
+      fundingIntervalHours,
+      anchorTimestamp,
+      sinceMs,
+      nowMs
+    );
     const totalFunding = allFunding.reduce((s, f) => s + num(f.amount), 0) * signFlip;
 
     let positionSize = pos.contracts;
@@ -332,6 +582,7 @@ async function processExchangePositions(name, exchange, nowMs, sinceMs) {
       positionValue,
       unrealizedPnl,
       count: allFunding.length,
+      fundingIntervalHours,
       totalFunding,
       fundingRecords: allFunding.map((f) => num(f.amount) * signFlip),
       startTime: toSGTime(sinceMs),

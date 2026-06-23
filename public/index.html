@@ -642,6 +642,7 @@
         const entries = grouped[sym];
         entries.sort((a, b) => a.side === 'short' ? -1 : b.side === 'short' ? 1 : 0);
         const symTotalFund = entries.reduce((s, e) => s + e.totalFunding, 0);
+        const showFundingIntervals = new Set(entries.map(e => e.count)).size > 1;
 
         entries.forEach((e, idx) => {
           sumPosValue += e.positionValue;
@@ -659,6 +660,9 @@
             const c = v > 0 ? 'pos' : v < 0 ? 'neg' : 'dim';
             return `<span class="${c}">${fmt(v)}</span>`;
           }).join('');
+          const intervalLabel = showFundingIntervals && e.fundingIntervalHours
+            ? ` (${Number(e.fundingIntervalHours).toLocaleString('en-US', { maximumFractionDigits: 2 })}h)`
+            : '';
 
           // Orders: [side] [KIND] [price] [×amount]  全部右对齐
           let ordersHtml = '<span class="faint">—</span>';
@@ -686,7 +690,7 @@
             <td class="num">${fmt(e.positionSize, sizeDp(e.positionSize))}</td>
             <td class="num">${fmt(e.positionValue)}</td>
             <td class="num ${sign(e.unrealizedPnl)}">${fmt(e.unrealizedPnl)}</td>
-            <td class="center dim">${e.count}</td>
+            <td class="center dim" style="white-space:nowrap;">${e.count}${intervalLabel}</td>
             <td><div class="funding-grid">${recs}</div></td>
             <td class="num ${sign(e.totalFunding)}">${fmt(e.totalFunding)}</td>
             <td class="orders-cell">${ordersHtml}</td>
