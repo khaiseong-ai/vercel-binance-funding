@@ -269,7 +269,8 @@ const parseIntervalHours = (value) => {
   if (value == null) return 0;
   if (typeof value === 'number') {
     if (value > HOUR_MS) return value / HOUR_MS;
-    if (value > 24) return value / 3600;
+    if (value > 24 && value <= 1440) return value / 60;
+    if (value > 1440) return value / 3600;
     return value;
   }
 
@@ -480,31 +481,29 @@ function buildExpectedFundingRecords(
     }
   }
 
-  const unused = records.slice();
-  const tolerance = intervalMs
-    ? Math.min(30 * 60 * 1000, intervalMs * 0.2)
-    : 15 * 60 * 1000;
-  const merged = expected.sort((a, b) => b.timestamp - a.timestamp).map((slot) => {
-    let bestIndex = -1;
+  const merged = [...new Map(
+    expected.map((slot) => [num(slot.timestamp), {
+      timestamp: num(slot.timestamp),
+      amount: 0,
+    }])
+  ).values()].sort((a, b) => b.timestamp - a.timestamp);
+  if (!merged.length) return records;
+
+  for (const record of records) {
+    let bestSlot = null;
     let bestDistance = Infinity;
-    for (let i = 0; i < unused.length; i++) {
-      const distance = Math.abs(num(unused[i].timestamp) - slot.timestamp);
+    for (const slot of merged) {
+      const distance = Math.abs(num(record.timestamp) - slot.timestamp);
       if (distance < bestDistance) {
         bestDistance = distance;
-        bestIndex = i;
+        bestSlot = slot;
       }
     }
-    if (bestIndex >= 0 && bestDistance <= tolerance) {
-      return unused.splice(bestIndex, 1)[0];
+    if (bestSlot) {
+      bestSlot.amount += num(record.amount);
     }
-    return { timestamp: slot.timestamp, amount: 0 };
-  });
-
-  for (const record of unused) {
-    const timestamp = num(record.timestamp);
-    if (timestamp >= sinceMs && timestamp <= nowMs) merged.push(record);
   }
-  return merged.sort((a, b) => b.timestamp - a.timestamp);
+  return merged;
 }
 
 async function processExchangePositions(name, exchange, nowMs, sinceMs) {
