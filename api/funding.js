@@ -370,17 +370,33 @@ async function fetchFundingInterval(exchange, symbol) {
 async function fetchFundingWindow(exchange, symbol, sinceMs, nowMs) {
   if (exchange.id === 'bitget') {
     try {
-      const records = await exchange.fetchFundingHistory(
-        symbol,
-        sinceMs,
-        FUNDING_PAGE_LIMIT,
-        { paginate: true, until: nowMs }
-      );
-      return records
+      const chunkMs = 24 * HOUR_MS;
+      const chunks = [];
+      for (let start = sinceMs; start < nowMs; start += chunkMs) {
+        const end = Math.min(start + chunkMs - 1, nowMs);
+        chunks.push(
+          exchange.fetchFundingHistory(
+            symbol,
+            start,
+            FUNDING_PAGE_LIMIT,
+            { until: end }
+          ).catch(() => [])
+        );
+      }
+
+      const pages = await Promise.all(chunks);
+      const seen = new Set();
+      return pages.flat()
         .filter((record) => record.timestamp >= sinceMs && record.timestamp <= nowMs)
+        .filter((record) => {
+          const key = record.id || `${record.timestamp}-${record.amount}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
         .sort((a, b) => b.timestamp - a.timestamp);
     } catch (err) {
-      console.error(`Bitget funding pagination: ${err.message}`);
+      console.error(`Bitget funding chunks: ${err.message}`);
     }
   }
 
