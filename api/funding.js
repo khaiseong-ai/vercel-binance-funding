@@ -2,6 +2,7 @@ const ccxt = require('ccxt');
 
 const FUNDING_WINDOW_MS = 72 * 60 * 60 * 1000;
 const FUNDING_PAGE_LIMIT = 100;
+const BACKPACK_FUNDING_PAGE_LIMIT = 1000;
 const FUNDING_MAX_PAGES = 3;
 const NEGATIVE_FUNDING_SIGN = new Set(['phemex', 'bybit']);
 const COINS = ['USDT', 'USDC'];
@@ -74,6 +75,12 @@ function buildExchanges() {
       password: process.env.BITGET_API_PASSWORD || process.env.BITGET_API_PASSPHRASE,
       enableRateLimit: true,
       options: { defaultType: 'swap' },
+    }),
+    backpack: new ccxt.backpack({
+      apiKey: process.env.BACKPACK_API_KEY,
+      secret: process.env.BACKPACK_API_SECRET,
+      enableRateLimit: true,
+      options: { defaultType: 'swap', recvWindow: 60000 },
     }),
   };
 }
@@ -226,12 +233,35 @@ async function fetchBitgetEquity(ex) {
   return w;
 }
 
+async function fetchBackpackEquity(ex) {
+  const w = emptyWallet();
+  const balance = await ex.fetchBalance().catch(() => ({}));
+
+  const parseBalanceCoin = (coin) =>
+    num(
+      balance?.total?.[coin] ||
+      balance?.free?.[coin] ||
+      balance?.used?.[coin] ||
+      balance?.[coin]?.total ||
+      balance?.[coin]?.free
+    );
+
+  // Backpack uses one portfolio-style capital account and perps settle in USDC,
+  // so keep USDC/USDT under futures to avoid double counting the same wallet.
+  w.futures.USDC = parseBalanceCoin('USDC');
+  w.futures.USDT = parseBalanceCoin('USDT');
+
+  w.total = sumWallet(w);
+  return w;
+}
+
 const BALANCE_FETCHERS = {
   binance: fetchBinanceEquity,
   phemex: fetchPhemexEquity,
   bybit: fetchBybitEquity,
   mexc: fetchMexcEquity,
   bitget: fetchBitgetEquity,
+  backpack: fetchBackpackEquity,
 };
 
 // ---------- Ticker ----------
@@ -369,6 +399,42 @@ async function fetchFundingInterval(exchange, symbol) {
 }
 
 async function fetchFundingWindow(exchange, symbol, sinceMs, nowMs) {
+  if (exchange.id === 'backpack') {
+    const seen = new Set();
+    const all = [];
+
+    for (let i = 0; i < FUNDING_MAX_PAGES; i++) {
+      let page;
+      try {
+        page = await exchange.fetchFundingHistory(
+          symbol,
+          sinceMs,
+          BACKPACK_FUNDING_PAGE_LIMIT,
+          { offset: i * BACKPACK_FUNDING_PAGE_LIMIT, sortDirection: 'Desc' }
+        );
+      } catch (err) {
+        console.error(`Backpack funding history: ${err.message}`);
+        break;
+      }
+      if (!page?.length) break;
+
+      for (const f of page) {
+        if (f.timestamp >= sinceMs && f.timestamp <= nowMs) {
+          const key = `${f.symbol}-${f.timestamp}-${f.amount}-${f.rate}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            all.push(f);
+          }
+        }
+      }
+
+      const oldest = Math.min(...page.map((f) => num(f.timestamp)).filter(Boolean));
+      if (!oldest || oldest < sinceMs || page.length < BACKPACK_FUNDING_PAGE_LIMIT) break;
+    }
+
+    return all.sort((a, b) => b.timestamp - a.timestamp);
+  }
+
   if (exchange.id === 'bitget') {
     try {
       const chunkMs = 24 * HOUR_MS;
@@ -517,7 +583,7 @@ async function processExchangePositions(name, exchange, nowMs, sinceMs) {
     return [];
   }
 
-  const open = positions.filter((p) => p.contracts && p.contracts > 0);
+  const open = positions.filter((p) => Math.abs(num(p.contracts)) > 0);
   if (!open.length) return [];
 
   const symbols = [...new Set(open.map((p) => p.symbol))];
@@ -581,6 +647,8 @@ async function processExchangePositions(name, exchange, nowMs, sinceMs) {
       const market = exchange.markets[pos.symbol];
       const contractSize = market?.contractSize || 1;
       positionSize = (pos.contracts || 0) * contractSize;
+    } else if (name === 'backpack') {
+      positionSize = Math.abs(num(pos.contracts));
     }
 
     const ticker = tickerCache[pos.symbol];
@@ -667,7 +735,7 @@ async function processExchangeOrders(name, exchange, positionRows) {
         return [...normal, ...triggers];
       }));
       results.push(...perSymbol.flat().map((o) => formatOrder(o, name, exchange)));
-    } else if (name === 'phemex' || name === 'bitget') {
+    } else if (name === 'phemex' || name === 'bitget' || name === 'backpack') {
       const posSymbols = [...new Set(
         positionRows.filter((p) => p.source === name)
           .map((p) => p.rawSymbol || `${p.symbol}/USDT:USDT`)
