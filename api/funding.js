@@ -1,5 +1,3 @@
-const ccxt = require('ccxt');
-
 const FUNDING_WINDOW_MS = 72 * 60 * 60 * 1000;
 const FUNDING_PAGE_LIMIT = 100;
 const BACKPACK_FUNDING_PAGE_LIMIT = 1000;
@@ -11,6 +9,13 @@ const COMMON_FUNDING_INTERVALS = [1, 2, 4, 8, 12, 24];
 
 const toSGTime = (ts) =>
   new Date(ts).toLocaleString('en-SG', { timeZone: 'Asia/Singapore' });
+
+let ccxtModulePromise;
+const loadCcxt = async () => {
+  if (!ccxtModulePromise) ccxtModulePromise = import('ccxt');
+  const mod = await ccxtModulePromise;
+  return mod.default || mod;
+};
 
 const cleanSymbol = (s) => {
   if (!s) return s;
@@ -43,7 +48,8 @@ const sumWallet = (w) => {
   return t;
 };
 
-function buildExchanges() {
+async function buildExchanges() {
+  const ccxt = await loadCcxt();
   return {
     binance: new ccxt.binance({
       apiKey: process.env.BINANCE_API_KEY,
@@ -871,7 +877,7 @@ function analyzeHedges(result) {
 // ---------- 主 ----------
 module.exports = async (req, res) => {
   const t0 = Date.now();
-  const exchanges = buildExchanges();
+  const exchanges = await buildExchanges();
   const nowMs = Date.now();
   const sinceMs = nowMs - FUNDING_WINDOW_MS;
   const exchangeList = Object.entries(exchanges);
