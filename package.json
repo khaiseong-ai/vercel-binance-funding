@@ -2,6 +2,7 @@
   "name": "vercel-binance-funding",
   "version": "1.0.0",
   "dependencies": {
+    "@noble/curves": "2.2.0",
     "ccxt": "4.5.59"
   }
 }

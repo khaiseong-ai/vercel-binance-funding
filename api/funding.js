@@ -17,6 +17,70 @@ const loadCcxt = async () => {
   return mod.default || mod;
 };
 
+let ed25519ModulePromise;
+const loadEd25519 = async () => {
+  if (!ed25519ModulePromise) {
+    ed25519ModulePromise = import('@noble/curves/ed25519.js');
+  }
+  const mod = await ed25519ModulePromise;
+  return mod.ed25519;
+};
+
+const backpackMarketId = (symbol) => {
+  if (!symbol) return symbol;
+  if (symbol.includes('_')) return symbol;
+  const [base, rest] = symbol.split('/');
+  const quote = (rest || '').split(':')[0] || 'USDC';
+  return `${base}_${quote}_PERP`;
+};
+
+const backpackUnifiedSymbol = (exchange, marketId) => {
+  const raw = exchange.markets_by_id?.[marketId];
+  const market = Array.isArray(raw) ? raw[0] : raw;
+  if (market?.symbol) return market.symbol;
+  const match = String(marketId || '').match(/^(.+)_([^_]+)_PERP$/);
+  return match ? `${match[1]}/${match[2]}:${match[2]}` : marketId;
+};
+
+async function backpackSignedRequest(path, instruction, params = {}) {
+  const apiKey = process.env.BACKPACK_API_KEY;
+  const secret = process.env.BACKPACK_API_SECRET;
+  if (!apiKey || !secret) throw new Error('Missing BACKPACK_API_KEY or BACKPACK_API_SECRET');
+
+  const timestamp = Date.now().toString();
+  const windowMs = '60000';
+  const sortedParams = Object.entries(params)
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .sort(([a], [b]) => a.localeCompare(b));
+  const query = sortedParams
+    .map(([key, value]) => {
+      const normalized = typeof value === 'boolean' ? String(value).toLowerCase() : String(value);
+      return `${encodeURIComponent(key)}=${encodeURIComponent(normalized)}`;
+    })
+    .join('&');
+  const payload = `instruction=${instruction}${query ? `&${query}` : ''}&timestamp=${timestamp}&window=${windowMs}`;
+  const ed25519 = await loadEd25519();
+  const signature = Buffer
+    .from(ed25519.sign(Buffer.from(payload), Buffer.from(secret, 'base64')))
+    .toString('base64');
+  const url = `https://api.backpack.exchange/${path}${query ? `?${query}` : ''}`;
+  const response = await fetch(url, {
+    headers: {
+      'X-API-Key': apiKey,
+      'X-Signature': signature,
+      'X-Timestamp': timestamp,
+      'X-Window': windowMs,
+    },
+  });
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    const message = typeof data === 'object' ? JSON.stringify(data) : text;
+    throw new Error(`backpack ${message}`);
+  }
+  return data;
+}
+
 const cleanSymbol = (s) => {
   if (!s) return s;
   let out = s;
@@ -241,16 +305,26 @@ async function fetchBitgetEquity(ex) {
 
 async function fetchBackpackEquity(ex) {
   const w = emptyWallet();
-  const balance = await ex.fetchBalance().catch(() => ({}));
+  const [balance, collateral] = await Promise.all([
+    backpackSignedRequest('api/v1/capital', 'balanceQuery').catch(() => ({})),
+    backpackSignedRequest('api/v1/capital/collateral', 'collateralQuery').catch(() => ({})),
+  ]);
+
+  const netEquity = num(collateral?.netEquity);
+  if (netEquity) {
+    w.futures.USDC = netEquity;
+    w.total = sumWallet(w);
+    return w;
+  }
 
   const parseBalanceCoin = (coin) =>
-    num(
-      balance?.total?.[coin] ||
-      balance?.free?.[coin] ||
-      balance?.used?.[coin] ||
-      balance?.[coin]?.total ||
-      balance?.[coin]?.free
-    );
+    num(balance?.[coin]?.available) +
+    num(balance?.[coin]?.locked) +
+    num(balance?.[coin]?.staked) +
+    num(balance?.[coin]?.total) +
+    num(balance?.[coin]?.free) +
+    num(balance?.total?.[coin]) +
+    num(balance?.free?.[coin]);
 
   // Backpack uses one portfolio-style capital account and perps settle in USDC,
   // so keep USDC/USDT under futures to avoid double counting the same wallet.
@@ -288,7 +362,7 @@ async function buildTickerCache(exchange, symbols) {
 }
 
 function computePnL(pos, ticker, positionSize) {
-  const currentPrice = ticker?.last || 0;
+  const currentPrice = ticker?.last || pos.markPrice || num(pos.info?.markPrice) || 0;
   const avgPrice = pos.entryPrice || pos.entry_price || 0;
   const amount = Math.abs(positionSize || pos.contracts || pos.positionAmt || 0);
   const side = pos.side || (pos.contracts > 0 ? 'long' : 'short');
@@ -408,15 +482,19 @@ async function fetchFundingWindow(exchange, symbol, sinceMs, nowMs) {
   if (exchange.id === 'backpack') {
     const seen = new Set();
     const all = [];
+    const marketId = backpackMarketId(symbol);
 
     for (let i = 0; i < FUNDING_MAX_PAGES; i++) {
       let page;
       try {
-        page = await exchange.fetchFundingHistory(
-          symbol,
-          sinceMs,
-          BACKPACK_FUNDING_PAGE_LIMIT,
-          { offset: i * BACKPACK_FUNDING_PAGE_LIMIT, sortDirection: 'Desc' }
+        page = await backpackSignedRequest(
+          'wapi/v1/history/funding',
+          'fundingHistoryQueryAll',
+          {
+            symbol: marketId,
+            limit: BACKPACK_FUNDING_PAGE_LIMIT,
+            offset: i * BACKPACK_FUNDING_PAGE_LIMIT,
+          }
         );
       } catch (err) {
         console.error(`Backpack funding history: ${err.message}`);
@@ -425,16 +503,23 @@ async function fetchFundingWindow(exchange, symbol, sinceMs, nowMs) {
       if (!page?.length) break;
 
       for (const f of page) {
-        if (f.timestamp >= sinceMs && f.timestamp <= nowMs) {
-          const key = `${f.symbol}-${f.timestamp}-${f.amount}-${f.rate}`;
+        const timestamp = Date.parse(`${f.intervalEndTimestamp}Z`);
+        if (timestamp >= sinceMs && timestamp <= nowMs) {
+          const key = `${f.symbol}-${timestamp}-${f.quantity}-${f.fundingRate}`;
           if (!seen.has(key)) {
             seen.add(key);
-            all.push(f);
+            all.push({
+              symbol: backpackUnifiedSymbol(exchange, f.symbol),
+              timestamp,
+              amount: num(f.quantity),
+              rate: num(f.fundingRate),
+              info: f,
+            });
           }
         }
       }
 
-      const oldest = Math.min(...page.map((f) => num(f.timestamp)).filter(Boolean));
+      const oldest = Math.min(...page.map((f) => Date.parse(`${f.intervalEndTimestamp}Z`)).filter(Boolean));
       if (!oldest || oldest < sinceMs || page.length < BACKPACK_FUNDING_PAGE_LIMIT) break;
     }
 
@@ -498,6 +583,24 @@ async function fetchFundingWindow(exchange, symbol, sinceMs, nowMs) {
 }
 
 // ---------- 持仓 ----------
+async function fetchBackpackPositions(exchange) {
+  const positions = await backpackSignedRequest('api/v1/position', 'positionQuery');
+  return (positions || []).map((p) => {
+    const netCost = num(p.netCost);
+    const contracts = Math.abs(num(p.netExposureQuantity || p.netQuantity));
+    return {
+      info: p,
+      id: p.positionId,
+      symbol: backpackUnifiedSymbol(exchange, p.symbol),
+      side: netCost < 0 ? 'short' : 'long',
+      contracts,
+      entryPrice: num(p.entryPrice || p.breakEvenPrice),
+      markPrice: num(p.markPrice),
+      unrealizedPnl: num(p.pnlUnrealized),
+    };
+  });
+}
+
 async function fetchFundingSchedule(exchange, symbol, sinceMs, nowMs) {
   if (!exchange.has?.fetchFundingRateHistory) return [];
 
@@ -581,7 +684,9 @@ function buildExpectedFundingRecords(
 async function processExchangePositions(name, exchange, nowMs, sinceMs) {
   let positions;
   try {
-    positions = (name === 'phemex' || name === 'mexc')
+    positions = name === 'backpack'
+      ? await fetchBackpackPositions(exchange)
+      : (name === 'phemex' || name === 'mexc')
       ? await exchange.fetch_positions()
       : await exchange.fetchPositions();
   } catch (err) {
@@ -658,7 +763,13 @@ async function processExchangePositions(name, exchange, nowMs, sinceMs) {
     }
 
     const ticker = tickerCache[pos.symbol];
-    const { unrealizedPnl, positionValue, currentPrice, side } = computePnL(pos, ticker, positionSize);
+    const computed = computePnL(pos, ticker, positionSize);
+    const unrealizedPnl = name === 'backpack' && Number.isFinite(num(pos.unrealizedPnl))
+      ? num(pos.unrealizedPnl)
+      : computed.unrealizedPnl;
+    const positionValue = computed.positionValue || num(pos.info?.netExposureNotional) || Math.abs(num(pos.info?.netCost));
+    const currentPrice = computed.currentPrice;
+    const side = computed.side;
 
     return {
       source: name,
@@ -724,6 +835,24 @@ function formatOrder(o, name, exchange) {
   };
 }
 
+async function fetchBackpackOpenOrders(exchange) {
+  const orders = await backpackSignedRequest('api/v1/orders', 'orderQueryAll');
+  return (orders || []).map((o) => ({
+    info: o,
+    exchange: 'backpack',
+    symbol: backpackUnifiedSymbol(exchange, o.symbol),
+    side: o.side === 'Bid' ? 'buy' : o.side === 'Ask' ? 'sell' : String(o.side || '').toLowerCase(),
+    type: o.orderType,
+    price: num(o.price || o.limitPrice || o.triggerPrice),
+    triggerPrice: num(
+      o.triggerPrice ||
+      o.stopLossTriggerPrice ||
+      o.takeProfitTriggerPrice
+    ),
+    amount: num(o.quantity || o.triggerQuantity),
+  }));
+}
+
 async function processExchangeOrders(name, exchange, positionRows) {
   const results = [];
   try {
@@ -741,7 +870,10 @@ async function processExchangeOrders(name, exchange, positionRows) {
         return [...normal, ...triggers];
       }));
       results.push(...perSymbol.flat().map((o) => formatOrder(o, name, exchange)));
-    } else if (name === 'phemex' || name === 'bitget' || name === 'backpack') {
+    } else if (name === 'backpack') {
+      const openOrders = await fetchBackpackOpenOrders(exchange);
+      results.push(...openOrders.map((o) => formatOrder(o, name, exchange)));
+    } else if (name === 'phemex' || name === 'bitget') {
       const posSymbols = [...new Set(
         positionRows.filter((p) => p.source === name)
           .map((p) => p.rawSymbol || `${p.symbol}/USDT:USDT`)
