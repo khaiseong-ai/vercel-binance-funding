@@ -110,7 +110,7 @@ async function hyperliquidInfo(body) {
 
 async function fetchFundingRelay(nowMs, sinceMs, fetchImpl = fetch) {
   const rawUrl = String(process.env.POSITION_RELAY_URL || '').trim();
-  const token = String(process.env.POSITION_RELAY_TOKEN || '').trim();
+  const token = await relayAuthorizationToken(fetchImpl);
   if (!rawUrl && !token) return { exchanges: {}, failures: {} };
   if (!rawUrl || !token) throw new Error('Funding relay configuration is incomplete');
 
@@ -170,6 +170,25 @@ async function fetchFundingRelay(nowMs, sinceMs, fetchImpl = fetch) {
     exchanges,
     failures: body.failures && typeof body.failures === 'object' ? body.failures : {},
   };
+}
+
+async function relayAuthorizationToken(fetchImpl) {
+  const requestUrl = String(process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '').trim();
+  const requestToken = String(process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN || '').trim();
+  if (requestUrl && requestToken) {
+    const url = new URL(requestUrl);
+    url.searchParams.set('audience', 'position-relay');
+    const response = await fetchImpl(url, {
+      headers: { authorization: `Bearer ${requestToken}` },
+      signal: AbortSignal.timeout(30000),
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok || !String(body?.value || '').trim()) {
+      throw new Error('Funding relay OIDC authorization failed');
+    }
+    return String(body.value).trim();
+  }
+  return String(process.env.POSITION_RELAY_TOKEN || '').trim();
 }
 
 function sanitizeRelayEquity(value) {

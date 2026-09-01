@@ -108,3 +108,47 @@ test('requires a complete HTTPS funding relay configuration', async () => {
     else process.env.POSITION_RELAY_TOKEN = previousToken;
   }
 });
+
+test('prefers a short-lived GitHub Actions OIDC token for the relay', async () => {
+  const names = [
+    'POSITION_RELAY_URL',
+    'POSITION_RELAY_TOKEN',
+    'POSITION_RELAY_EXCHANGES',
+    'ACTIONS_ID_TOKEN_REQUEST_URL',
+    'ACTIONS_ID_TOKEN_REQUEST_TOKEN'
+  ];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  process.env.POSITION_RELAY_URL = 'https://relay.example/state';
+  process.env.POSITION_RELAY_TOKEN = 'fallback-token';
+  process.env.POSITION_RELAY_EXCHANGES = 'bybit';
+  process.env.ACTIONS_ID_TOKEN_REQUEST_URL = 'https://oidc.actions.test/token?api-version=2';
+  process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = 'request-token';
+
+  let oidcCalls = 0;
+  let relayCalls = 0;
+  try {
+    const result = await fetchFundingRelay(2000, 1000, async (input, options) => {
+      const url = new URL(input);
+      if (url.hostname === 'oidc.actions.test') {
+        oidcCalls += 1;
+        assert.equal(url.searchParams.get('audience'), 'position-relay');
+        assert.equal(options.headers.authorization, 'Bearer request-token');
+        return Response.json({ value: 'short-lived-jwt' });
+      }
+      relayCalls += 1;
+      assert.equal(options.headers.authorization, 'Bearer short-lived-jwt');
+      return Response.json({
+        ok: true,
+        exchanges: { bybit: { equity: {}, positions: [], orders: [] } }
+      });
+    });
+    assert.equal(oidcCalls, 1);
+    assert.equal(relayCalls, 1);
+    assert.deepEqual(Object.keys(result.exchanges), ['bybit']);
+  } finally {
+    for (const name of names) {
+      if (previous[name] === undefined) delete process.env[name];
+      else process.env[name] = previous[name];
+    }
+  }
+});
