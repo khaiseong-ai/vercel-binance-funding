@@ -1235,7 +1235,7 @@ async function buildFundingPayload() {
 let fundingResponseCache;
 let fundingResponsePromise;
 
-module.exports = async (req, res) => {
+async function fundingHandler(req, res) {
   const cacheSeconds = Math.max(30, Math.floor(RESPONSE_CACHE_TTL_MS / 1000));
   res.setHeader(
     'Cache-Control',
@@ -1268,4 +1268,7 @@ module.exports = async (req, res) => {
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
-};
+}
+
+module.exports = fundingHandler;
+module.exports.buildFundingPayload = buildFundingPayload;

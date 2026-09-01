@@ -1,6 +1,11 @@
 {
   "name": "vercel-binance-funding",
   "version": "1.0.0",
+  "scripts": {
+    "check": "node --check api/funding.js && node --check lib/funding-sheet.js && node --check scripts/funding-sheet.mjs",
+    "test": "node --test",
+    "snapshot:sheet": "node scripts/funding-sheet.mjs"
+  },
   "dependencies": {
     "@noble/curves": "2.2.0",
     "ccxt": "4.5.59"
