@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
+  assertFundingRelayCoverage,
   buildFundingSheetSnapshot,
   postFundingSheetSnapshot
 } = require("../lib/funding-sheet.js");
@@ -53,4 +54,28 @@ test("posts only to an authenticated Apps Script web app", async () => {
     () => postFundingSheetSnapshot({ url: "https://example.com/write", secret: "x" }, {}),
     /URL is invalid/
   );
+});
+
+test("blocks Sheet writes when a requested relay exchange is missing", () => {
+  assert.doesNotThrow(() => assertFundingRelayCoverage({
+    relayStatus: {
+      configured: true,
+      requested: ["binance", "bybit"],
+      received: ["binance", "bybit"],
+      failures: []
+    }
+  }));
+
+  assert.throws(() => assertFundingRelayCoverage({
+    relayStatus: {
+      configured: true,
+      requested: ["binance", "bybit"],
+      received: ["bybit"],
+      failures: ["binance"]
+    }
+  }), /Funding relay incomplete for: binance/);
+
+  assert.doesNotThrow(() => assertFundingRelayCoverage({
+    relayStatus: { configured: false }
+  }));
 });

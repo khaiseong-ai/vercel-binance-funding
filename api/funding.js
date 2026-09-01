@@ -108,6 +108,13 @@ async function hyperliquidInfo(body) {
   return data;
 }
 
+function requestedFundingRelayExchanges() {
+  return String(process.env.POSITION_RELAY_EXCHANGES || 'bybit')
+    .split(',')
+    .map((name) => name.trim().toLowerCase())
+    .filter((name) => FUNDING_RELAY_EXCHANGES.has(name));
+}
+
 async function fetchFundingRelay(nowMs, sinceMs, fetchImpl = fetch) {
   const rawUrl = String(process.env.POSITION_RELAY_URL || '').trim();
   const token = await relayAuthorizationToken(fetchImpl);
@@ -119,10 +126,7 @@ async function fetchFundingRelay(nowMs, sinceMs, fetchImpl = fetch) {
   url.pathname = '/funding';
   url.search = '';
   url.hash = '';
-  const requestedExchanges = String(process.env.POSITION_RELAY_EXCHANGES || 'bybit')
-    .split(',')
-    .map((name) => name.trim().toLowerCase())
-    .filter((name) => FUNDING_RELAY_EXCHANGES.has(name));
+  const requestedExchanges = requestedFundingRelayExchanges();
   const credentials = {};
   if (requestedExchanges.includes('binance')) {
     credentials.binance = {
@@ -1277,7 +1281,16 @@ async function buildFundingPayload() {
   const sinceMs = nowMs - FUNDING_WINDOW_MS;
 
   try {
+    const relayRequested = requestedFundingRelayExchanges();
+    const relayConfigured = Boolean(
+      String(process.env.POSITION_RELAY_URL || '').trim()
+      || String(process.env.POSITION_RELAY_TOKEN || '').trim()
+      || String(process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '').trim()
+      || String(process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN || '').trim()
+    );
+    let relayRequestFailed = false;
     const relay = await fetchFundingRelay(nowMs, sinceMs).catch(() => {
+      relayRequestFailed = true;
       console.error('Funding relay unavailable');
       return { exchanges: {}, failures: {} };
     });
@@ -1377,6 +1390,14 @@ async function buildFundingPayload() {
       equityOverview,
       totalEquity,
       hedgeHealth,
+      relayStatus: {
+        configured: relayConfigured,
+        requested: relayRequested,
+        received: Object.keys(relay.exchanges),
+        failures: relayRequestFailed
+          ? relayRequested
+          : Object.keys(relay.failures || {}),
+      },
       elapsedMs: elapsed,
     };
   } catch (e) {

@@ -5,7 +5,11 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const { buildFundingPayload } = require("../api/funding.js");
-const { buildFundingSheetSnapshot, postFundingSheetSnapshot } = require("../lib/funding-sheet.js");
+const {
+  assertFundingRelayCoverage,
+  buildFundingSheetSnapshot,
+  postFundingSheetSnapshot
+} = require("../lib/funding-sheet.js");
 
 const defaultEnvPath = path.join(os.homedir(), "AppData", "Local", "ks-funding", "funding.env");
 const envPath = process.env.FUNDING_LOCAL_ENV || defaultEnvPath;
@@ -34,6 +38,7 @@ if (!process.env.BITGET_API_PASSWORD && process.env.BITGET_API_PASSPHRASE) {
 }
 
 const payload = await buildFundingPayload();
+assertFundingRelayCoverage(payload);
 const snapshot = buildFundingSheetSnapshot(payload);
 if (snapshot.positions.length === 0 && snapshot.totalEquity === 0) {
   throw new Error("Funding snapshot is empty; Sheet was not changed");
