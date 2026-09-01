@@ -10,6 +10,10 @@ test('fetches and sanitizes Binance and Bybit funding relay data', async () => {
   const previousBybitKey = process.env.BYBIT_API_KEY;
   const previousBybitSecret = process.env.BYBIT_API_SECRET;
   const previousRelayExchanges = process.env.POSITION_RELAY_EXCHANGES;
+  const previousOidcUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  const previousOidcToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  delete process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
   process.env.POSITION_RELAY_URL = 'https://relay.example/state?ignored=true';
   process.env.POSITION_RELAY_TOKEN = 'relay-token';
   process.env.BINANCE_API_KEY = 'binance-key';
@@ -87,13 +91,21 @@ test('fetches and sanitizes Binance and Bybit funding relay data', async () => {
     else process.env.BYBIT_API_SECRET = previousBybitSecret;
     if (previousRelayExchanges === undefined) delete process.env.POSITION_RELAY_EXCHANGES;
     else process.env.POSITION_RELAY_EXCHANGES = previousRelayExchanges;
+    if (previousOidcUrl === undefined) delete process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+    else process.env.ACTIONS_ID_TOKEN_REQUEST_URL = previousOidcUrl;
+    if (previousOidcToken === undefined) delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+    else process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = previousOidcToken;
   }
 });
 
 test('requires a complete HTTPS funding relay configuration', async () => {
   const previousUrl = process.env.POSITION_RELAY_URL;
   const previousToken = process.env.POSITION_RELAY_TOKEN;
+  const previousOidcUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  const previousOidcToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
   try {
+    delete process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+    delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
     process.env.POSITION_RELAY_URL = 'http://relay.example';
     process.env.POSITION_RELAY_TOKEN = 'relay-token';
     await assert.rejects(() => fetchFundingRelay(2000, 1000), /must use HTTPS/);
@@ -106,6 +118,10 @@ test('requires a complete HTTPS funding relay configuration', async () => {
     else process.env.POSITION_RELAY_URL = previousUrl;
     if (previousToken === undefined) delete process.env.POSITION_RELAY_TOKEN;
     else process.env.POSITION_RELAY_TOKEN = previousToken;
+    if (previousOidcUrl === undefined) delete process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+    else process.env.ACTIONS_ID_TOKEN_REQUEST_URL = previousOidcUrl;
+    if (previousOidcToken === undefined) delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+    else process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = previousOidcToken;
   }
 });
 
