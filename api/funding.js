@@ -172,7 +172,7 @@ async function fetchFundingRelay(nowMs, sinceMs, fetchImpl = fetch) {
   }
   return {
     exchanges,
-    failures: body.failures && typeof body.failures === 'object' ? body.failures : {},
+    failures: sanitizeRelayFailures(body.failures),
   };
 }
 
@@ -204,6 +204,17 @@ function sanitizeRelayEquity(value) {
   equity.unrealizedPnl = num(value?.unrealizedPnl);
   equity.total = sumWallet(equity);
   return equity;
+}
+
+function sanitizeRelayFailures(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const failures = {};
+  for (const [name, rawCode] of Object.entries(value)) {
+    if (!FUNDING_RELAY_EXCHANGES.has(name)) continue;
+    const code = String(rawCode || 'network');
+    failures[name] = /^[a-z0-9_-]+$/i.test(code) ? code : 'network';
+  }
+  return failures;
 }
 
 function sanitizeRelayPosition(name, row) {
@@ -1395,8 +1406,8 @@ async function buildFundingPayload() {
         requested: relayRequested,
         received: Object.keys(relay.exchanges),
         failures: relayRequestFailed
-          ? relayRequested
-          : Object.keys(relay.failures || {}),
+          ? Object.fromEntries(relayRequested.map((name) => [name, 'request_failed']))
+          : relay.failures,
       },
       elapsedMs: elapsed,
     };

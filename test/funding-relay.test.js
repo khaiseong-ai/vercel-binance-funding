@@ -54,6 +54,10 @@ test('fetches and sanitizes Binance and Bybit funding relay data', async () => {
           },
           bybit: { equity: {}, positions: [], orders: [] },
           unexpected: { positions: [{ symbol: 'SECRET' }], orders: [] }
+        },
+        failures: {
+          binance: 'api_-2015',
+          unexpected: 'private upstream detail'
         }
       });
     });
@@ -75,6 +79,7 @@ test('fetches and sanitizes Binance and Bybit funding relay data', async () => {
     assert.equal(result.exchanges.binance.positions[0].count, 2);
     assert.equal(result.exchanges.binance.positions[0].totalFunding, 1.25);
     assert.deepEqual(result.exchanges.binance.positions[0].fundingRecords, [0, 1.25]);
+    assert.deepEqual(result.failures, { binance: 'api_-2015' });
     assert.doesNotMatch(JSON.stringify(result), /privateField|accountAlias|hidden|unexpected/);
   } finally {
     if (previousUrl === undefined) delete process.env.POSITION_RELAY_URL;

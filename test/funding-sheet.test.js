@@ -62,7 +62,7 @@ test("blocks Sheet writes when a requested relay exchange is missing", () => {
       configured: true,
       requested: ["binance", "bybit"],
       received: ["binance", "bybit"],
-      failures: []
+      failures: {}
     }
   }));
 
@@ -71,9 +71,9 @@ test("blocks Sheet writes when a requested relay exchange is missing", () => {
       configured: true,
       requested: ["binance", "bybit"],
       received: ["bybit"],
-      failures: ["binance"]
+      failures: { binance: "api_-2015" }
     }
-  }), /Funding relay incomplete for: binance/);
+  }), /Funding relay incomplete for: binance \(api_-2015\)/);
 
   assert.doesNotThrow(() => assertFundingRelayCoverage({
     relayStatus: { configured: false }
