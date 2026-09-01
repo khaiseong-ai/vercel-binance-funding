@@ -205,6 +205,7 @@ function appendRun_(spreadsheet, row) {
 }
 
 function styleSheet_(sheet, columnCount, rowCount, options) {
+  if (sheet.getFilter()) sheet.getFilter().remove();
   const header = sheet.getRange(1, 1, 1, columnCount);
   header
     .setBackground("#303030")
