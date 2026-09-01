@@ -7,6 +7,7 @@ const COINS = ['USDT', 'USDC'];
 const HOUR_MS = 60 * 60 * 1000;
 const COMMON_FUNDING_INTERVALS = [1, 2, 4, 8, 12, 24];
 const HYPERLIQUID_REST_BASE = process.env.HYPERLIQUID_REST_BASE || 'https://api.hyperliquid.xyz';
+const FUNDING_RELAY_EXCHANGES = new Set(['binance', 'bybit']);
 const RESPONSE_CACHE_TTL_MS = Math.max(
   30 * 1000,
   Number(process.env.FUNDING_CACHE_TTL_MS) || 60 * 1000
@@ -105,6 +106,125 @@ async function hyperliquidInfo(body) {
   const data = text ? JSON.parse(text) : null;
   if (!response.ok) throw new Error(`hyperliquid ${body.type} HTTP ${response.status}: ${text.slice(0, 200)}`);
   return data;
+}
+
+async function fetchFundingRelay(nowMs, sinceMs, fetchImpl = fetch) {
+  const rawUrl = String(process.env.POSITION_RELAY_URL || '').trim();
+  const token = String(process.env.POSITION_RELAY_TOKEN || '').trim();
+  if (!rawUrl && !token) return { exchanges: {}, failures: {} };
+  if (!rawUrl || !token) throw new Error('Funding relay configuration is incomplete');
+
+  const url = new URL(rawUrl);
+  if (url.protocol !== 'https:') throw new Error('Funding relay URL must use HTTPS');
+  url.pathname = '/funding';
+  url.search = '';
+  url.hash = '';
+  const requestedExchanges = String(process.env.POSITION_RELAY_EXCHANGES || 'bybit')
+    .split(',')
+    .map((name) => name.trim().toLowerCase())
+    .filter((name) => FUNDING_RELAY_EXCHANGES.has(name));
+  const credentials = {};
+  if (requestedExchanges.includes('binance')) {
+    credentials.binance = {
+      apiKey: process.env.BINANCE_API_KEY || '',
+      apiSecret: process.env.BINANCE_API_SECRET || '',
+    };
+  }
+  if (requestedExchanges.includes('bybit')) {
+    credentials.bybit = {
+      apiKey: process.env.BYBIT_API_KEY || '',
+      apiSecret: process.env.BYBIT_API_SECRET || '',
+    };
+  }
+  const response = await fetchImpl(url, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      startTime: sinceMs,
+      endTime: nowMs,
+      exchanges: requestedExchanges,
+      credentials,
+    }),
+    redirect: 'follow',
+    signal: AbortSignal.timeout(120000),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok || !body?.ok || !body.exchanges || typeof body.exchanges !== 'object') {
+    throw new Error(`Funding relay unavailable with HTTP ${response.status}`);
+  }
+
+  const exchanges = {};
+  for (const name of FUNDING_RELAY_EXCHANGES) {
+    const value = body.exchanges[name];
+    if (!value || !Array.isArray(value.positions) || !Array.isArray(value.orders)) continue;
+    exchanges[name] = {
+      equity: sanitizeRelayEquity(value.equity),
+      positions: value.positions.map((row) => sanitizeRelayPosition(name, row)).filter(Boolean),
+      orders: value.orders.map((row) => sanitizeRelayOrder(name, row)).filter(Boolean),
+    };
+  }
+  return {
+    exchanges,
+    failures: body.failures && typeof body.failures === 'object' ? body.failures : {},
+  };
+}
+
+function sanitizeRelayEquity(value) {
+  const equity = emptyWallet();
+  for (const bucket of ['futures', 'spot', 'funding']) {
+    equity[bucket].USDT = num(value?.[bucket]?.USDT);
+    equity[bucket].USDC = num(value?.[bucket]?.USDC);
+  }
+  equity.unrealizedPnl = num(value?.unrealizedPnl);
+  equity.total = sumWallet(equity);
+  return equity;
+}
+
+function sanitizeRelayPosition(name, row) {
+  const positionSize = Math.abs(num(row?.positionSize));
+  const side = String(row?.side || '').toLowerCase();
+  const symbol = cleanSymbol(row?.symbol);
+  if (!positionSize || !symbol || !['long', 'short'].includes(side)) return null;
+  const fundingRecords = Array.isArray(row.fundingRecords) ? row.fundingRecords.map(num) : [];
+  return {
+    source: name,
+    symbol,
+    rawSymbol: String(row.rawSymbol || row.symbol || ''),
+    side,
+    currentPrice: num(row.currentPrice),
+    entryPrice: num(row.entryPrice),
+    positionSize,
+    positionValue: Math.abs(num(row.positionValue)),
+    unrealizedPnl: num(row.unrealizedPnl),
+    count: fundingRecords.length,
+    fundingIntervalHours: num(row.fundingIntervalHours),
+    totalFunding: fundingRecords.reduce((sum, amount) => sum + amount, 0),
+    fundingRecords,
+    startTime: String(row.startTime || ''),
+    endTime: String(row.endTime || ''),
+  };
+}
+
+function sanitizeRelayOrder(name, row) {
+  const price = num(row?.price);
+  const triggerPrice = num(row?.triggerPrice);
+  const amount = Math.abs(num(row?.amount));
+  const symbol = cleanSymbol(row?.symbol);
+  if (!symbol || (!price && !triggerPrice)) return null;
+  return {
+    exchange: name,
+    symbol,
+    side: String(row.side || '').toLowerCase(),
+    price: price || triggerPrice,
+    triggerPrice,
+    limitPrice: num(row.limitPrice),
+    amount,
+    kind: String(row.kind || 'LIMIT').toUpperCase(),
+    orderType: String(row.orderType || '').toUpperCase(),
+  };
 }
 
 async function fetchHyperliquidAccount(nowMs, sinceMs) {
@@ -560,8 +680,8 @@ async function buildFundingRateCache(exchange, symbols) {
   if (!symbols.length || !exchange.has?.fetchFundingRates) return {};
   try {
     return await exchange.fetchFundingRates(symbols) || {};
-  } catch (err) {
-    console.error(`Funding rate cache: ${err.message}`);
+  } catch {
+    console.error('Funding rate cache unavailable');
     return {};
   }
 }
@@ -571,8 +691,8 @@ async function buildFundingIntervalCache(exchange, symbols) {
   if (exchange.has?.fetchFundingIntervals) {
     try {
       return await exchange.fetchFundingIntervals(symbols) || {};
-    } catch (err) {
-      console.error(`Funding interval cache: ${err.message}`);
+    } catch {
+      console.error('Funding interval cache unavailable');
     }
   }
   if (exchange.has?.fetchFundingInterval) {
@@ -615,8 +735,8 @@ async function fetchFundingWindow(exchange, symbol, sinceMs, nowMs) {
             offset: i * BACKPACK_FUNDING_PAGE_LIMIT,
           }
         );
-      } catch (err) {
-        console.error(`Backpack funding history: ${err.message}`);
+      } catch {
+        console.error('Backpack funding history unavailable');
         break;
       }
       if (!page?.length) break;
@@ -672,8 +792,8 @@ async function fetchFundingWindow(exchange, symbol, sinceMs, nowMs) {
           return true;
         })
         .sort((a, b) => b.timestamp - a.timestamp);
-    } catch (err) {
-      console.error(`Bitget funding chunks: ${err.message}`);
+    } catch {
+      console.error('Bitget funding chunks unavailable');
     }
   }
 
@@ -808,8 +928,8 @@ async function processExchangePositions(name, exchange, nowMs, sinceMs) {
       : (name === 'phemex' || name === 'mexc')
       ? await exchange.fetch_positions()
       : await exchange.fetchPositions();
-  } catch (err) {
-    console.error(`❌ ${name} positions:`, err.message);
+  } catch {
+    console.error(`${name} positions unavailable`);
     return [];
   }
 
@@ -1005,8 +1125,8 @@ async function processExchangeOrders(name, exchange, positionRows) {
       const openOrders = await exchange.fetchOpenOrders().catch(() => []);
       results.push(...openOrders.map((o) => formatOrder(o, name, exchange)));
     }
-  } catch (err) {
-    console.error(`❌ ${name} orders:`, err.message);
+  } catch {
+    console.error(`${name} orders unavailable`);
   }
 
   // 过滤无效订单（价格和数量都为 0 → 已成交或无效记录）
@@ -1136,20 +1256,25 @@ async function buildFundingPayload() {
   const exchanges = await getExchanges();
   const nowMs = Date.now();
   const sinceMs = nowMs - FUNDING_WINDOW_MS;
-  const exchangeList = Object.entries(exchanges);
 
   try {
+    const relay = await fetchFundingRelay(nowMs, sinceMs).catch(() => {
+      console.error('Funding relay unavailable');
+      return { exchanges: {}, failures: {} };
+    });
+    const relayNames = new Set(Object.keys(relay.exchanges));
+    const exchangeList = Object.entries(exchanges).filter(([name]) => !relayNames.has(name));
     const hyperliquidPromise = fetchHyperliquidAccount(nowMs, sinceMs).catch((err) => {
-      console.error(`hyperliquid account: ${err.message}`);
+      console.error('hyperliquid account unavailable');
       return { equity: emptyWallet(), positions: [], orders: [] };
     });
     const perExchangePromises = exchangeList.map(async ([name, exchange]) => {
       try { await exchange.loadMarkets(); }
-      catch (err) { console.error(`❌ ${name} loadMarkets:`, err.message); }
+      catch { console.error(`${name} markets unavailable`); }
 
       const [equity, positions] = await Promise.all([
-        BALANCE_FETCHERS[name](exchange).catch((err) => {
-          console.error(`❌ ${name} balance:`, err.message);
+        BALANCE_FETCHERS[name](exchange).catch(() => {
+          console.error(`${name} balance unavailable`);
           return emptyWallet();
         }),
         processExchangePositions(name, exchange, nowMs, sinceMs),
@@ -1168,6 +1293,10 @@ async function buildFundingPayload() {
       equityOverview[name] = equity;
       result.push(...positions);
     }
+    for (const [name, value] of Object.entries(relay.exchanges)) {
+      equityOverview[name] = value.equity;
+      result.push(...value.positions);
+    }
     equityOverview.hyperliquid = hyperliquid.equity;
     result.push(...hyperliquid.positions);
 
@@ -1184,7 +1313,12 @@ async function buildFundingPayload() {
       processExchangeOrders(name, exchange, result)
     );
     const ordersPerExchange = await Promise.all(orderPromises);
-    const dedupedOrders = dedupeOrders([...ordersPerExchange.flat(), ...hyperliquid.orders]);
+    const relayOrders = Object.values(relay.exchanges).flatMap((value) => value.orders);
+    const dedupedOrders = dedupeOrders([
+      ...ordersPerExchange.flat(),
+      ...relayOrders,
+      ...hyperliquid.orders,
+    ]);
 
     const orderIndex = new Map();
     for (const o of dedupedOrders) {
@@ -1227,7 +1361,7 @@ async function buildFundingPayload() {
       elapsedMs: elapsed,
     };
   } catch (e) {
-    console.error('❌ Error:', e);
+    console.error('Funding payload failed');
     throw e;
   }
 }
@@ -1272,3 +1406,4 @@ async function fundingHandler(req, res) {
 
 module.exports = fundingHandler;
 module.exports.buildFundingPayload = buildFundingPayload;
+module.exports.fetchFundingRelay = fetchFundingRelay;
