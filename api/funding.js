@@ -304,7 +304,16 @@ async function fetchHyperliquidAccount(nowMs, sinceMs) {
       const signedSize = num(pos.szi);
       if (!signedSize) continue;
       const positionSize = Math.abs(signedSize);
-      const records = (fundingByCoin.get(pos.coin) || []).sort((a, b) => b.timestamp - a.timestamp);
+      const actualRecords = (fundingByCoin.get(pos.coin) || [])
+        .sort((a, b) => b.timestamp - a.timestamp);
+      const records = buildExpectedFundingRecords(
+        actualRecords,
+        [],
+        1,
+        actualRecords[0]?.timestamp,
+        sinceMs,
+        nowMs
+      );
       const positionValue = Math.abs(num(pos.positionValue));
       const currentPrice = positionSize ? positionValue / positionSize : 0;
       sizeByCoin.set(pos.coin, positionSize);
@@ -915,11 +924,10 @@ function buildExpectedFundingRecords(
   const intervalMs = intervalHours * HOUR_MS;
   let expected = schedule.slice();
 
-  if (!expected.length) {
-    if (!intervalMs) return records;
-    let anchor = num(anchorTimestamp);
+  if (intervalMs) {
+    let anchor = num(anchorTimestamp) || num(expected[0]?.timestamp);
     if (!anchor && records.length) anchor = num(records[0].timestamp);
-    if (!anchor) return records;
+    if (!anchor) anchor = Math.floor(nowMs / intervalMs) * intervalMs;
     while (anchor > nowMs) anchor -= intervalMs;
     while (anchor + intervalMs <= nowMs) anchor += intervalMs;
 
@@ -934,7 +942,9 @@ function buildExpectedFundingRecords(
       timestamp: num(slot.timestamp),
       amount: 0,
     }])
-  ).values()].sort((a, b) => b.timestamp - a.timestamp);
+  ).values()]
+    .filter((slot) => slot.timestamp >= sinceMs && slot.timestamp <= nowMs)
+    .sort((a, b) => b.timestamp - a.timestamp);
   if (!merged.length) return records;
 
   for (const record of records) {
@@ -1458,3 +1468,4 @@ async function fundingHandler(req, res) {
 module.exports = fundingHandler;
 module.exports.buildFundingPayload = buildFundingPayload;
 module.exports.fetchFundingRelay = fetchFundingRelay;
+module.exports.buildExpectedFundingRecords = buildExpectedFundingRecords;
