@@ -2,6 +2,7 @@
   "version": 2,
   "routes": [
     { "src": "/api/funding", "dest": "/api/funding.js" },
+    { "src": "/api/backpack-history", "dest": "/api/backpack-history.js" },
     { "src": "/", "dest": "/index.html" }
   ]
 }

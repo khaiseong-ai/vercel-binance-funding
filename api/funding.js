@@ -6,6 +6,11 @@ const NEGATIVE_FUNDING_SIGN = new Set(['phemex', 'bybit']);
 const COINS = ['USDT', 'USDC'];
 const HOUR_MS = 60 * 60 * 1000;
 const COMMON_FUNDING_INTERVALS = [1, 2, 4, 8, 12, 24];
+const HYPERLIQUID_REST_BASE = process.env.HYPERLIQUID_REST_BASE || 'https://api.hyperliquid.xyz';
+const RESPONSE_CACHE_TTL_MS = Math.max(
+  30 * 1000,
+  Number(process.env.FUNDING_CACHE_TTL_MS) || 60 * 1000
+);
 
 const toSGTime = (ts) =>
   new Date(ts).toLocaleString('en-SG', { timeZone: 'Asia/Singapore' });
@@ -83,11 +88,114 @@ async function backpackSignedRequest(path, instruction, params = {}) {
 
 const cleanSymbol = (s) => {
   if (!s) return s;
-  let out = s;
+  let out = String(s).toUpperCase();
   if (out.includes('/')) out = out.split('/')[0];
-  if (out.includes(':')) out = out.split(':')[0];
-  return out;
+  else if (out.includes(':')) out = out.split(':').pop();
+  const aliases = { BROCCOLI714: 'BROCCOLI', CL: 'XTI', MONAD: 'MON', PUMPFUN: 'PUMP' };
+  return aliases[out] || out;
 };
+
+async function hyperliquidInfo(body) {
+  const response = await fetch(`${HYPERLIQUID_REST_BASE}/info`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!response.ok) throw new Error(`hyperliquid ${body.type} HTTP ${response.status}: ${text.slice(0, 200)}`);
+  return data;
+}
+
+async function fetchHyperliquidAccount(nowMs, sinceMs) {
+  const wallet = process.env.HYPERLIQUID_WALLET;
+  if (!wallet) return { equity: emptyWallet(), positions: [], orders: [] };
+  const configured = String(process.env.HYPERLIQUID_DEXS || 'xyz')
+    .split(',').map((value) => value.trim()).filter(Boolean);
+  const dexes = ['', ...configured].filter((value, index, values) => values.indexOf(value) === index);
+
+  const perDex = await Promise.all(dexes.map(async (dex) => {
+    const dexParam = dex ? { dex } : {};
+    const [state, funding, openOrders] = await Promise.all([
+      hyperliquidInfo({ type: 'clearinghouseState', user: wallet, ...dexParam }),
+      hyperliquidInfo({ type: 'userFunding', user: wallet, startTime: sinceMs, endTime: nowMs, ...dexParam }),
+      hyperliquidInfo({ type: 'frontendOpenOrders', user: wallet, ...dexParam }),
+    ]);
+    return { state, funding, openOrders };
+  }));
+
+  const equity = emptyWallet();
+  equity.futures.USDC = perDex.reduce(
+    (sum, item) => sum + num(item.state?.marginSummary?.accountValue), 0
+  );
+  equity.total = sumWallet(equity);
+
+  const positions = [];
+  const orders = [];
+  for (const { state, funding, openOrders } of perDex) {
+    const fundingByCoin = new Map();
+    for (const record of funding || []) {
+      const coin = record?.delta?.coin;
+      if (!coin) continue;
+      if (!fundingByCoin.has(coin)) fundingByCoin.set(coin, []);
+      fundingByCoin.get(coin).push({
+        timestamp: num(record.time),
+        amount: num(record.delta?.usdc),
+      });
+    }
+
+    const sizeByCoin = new Map();
+    for (const item of state?.assetPositions || []) {
+      const pos = item.position || item;
+      const signedSize = num(pos.szi);
+      if (!signedSize) continue;
+      const positionSize = Math.abs(signedSize);
+      const records = (fundingByCoin.get(pos.coin) || []).sort((a, b) => b.timestamp - a.timestamp);
+      const positionValue = Math.abs(num(pos.positionValue));
+      const currentPrice = positionSize ? positionValue / positionSize : 0;
+      sizeByCoin.set(pos.coin, positionSize);
+      positions.push({
+        source: 'hyperliquid',
+        symbol: cleanSymbol(pos.coin),
+        rawSymbol: pos.coin,
+        side: signedSize > 0 ? 'long' : 'short',
+        currentPrice,
+        entryPrice: num(pos.entryPx),
+        positionSize,
+        positionValue,
+        unrealizedPnl: num(pos.unrealizedPnl),
+        count: records.length,
+        fundingIntervalHours: 1,
+        totalFunding: records.reduce((sum, record) => sum + record.amount, 0),
+        fundingRecords: records.map((record) => record.amount),
+        startTime: toSGTime(sinceMs),
+        endTime: toSGTime(nowMs),
+      });
+    }
+
+    for (const order of openOrders || []) {
+      const triggerPrice = num(order.triggerPx);
+      const limitPrice = num(order.limitPx);
+      const orderType = String(order.orderType || (order.isTrigger ? 'TRIGGER' : 'LIMIT')).toUpperCase();
+      let kind = 'LIMIT';
+      if (/TAKE PROFIT|TAKE_PROFIT|TAKEPROFIT/.test(orderType)) kind = 'TP';
+      else if (/STOP/.test(orderType)) kind = 'SL';
+      else if (triggerPrice) kind = 'TRIGGER';
+      orders.push({
+        exchange: 'hyperliquid',
+        symbol: cleanSymbol(order.coin),
+        side: order.side === 'B' ? 'buy' : 'sell',
+        price: triggerPrice || limitPrice,
+        triggerPrice,
+        limitPrice,
+        amount: num(order.sz || order.origSz) || sizeByCoin.get(order.coin) || 0,
+        kind,
+        orderType,
+      });
+    }
+  }
+  return { equity, positions, orders };
+}
 
 const convertMexcOrderSide = (code) => {
   if (code === '1' || code === 1 || code === '3' || code === 3) return 'buy';
@@ -154,6 +262,17 @@ async function buildExchanges() {
     }),
   };
 }
+
+let exchangesPromise;
+const getExchanges = async () => {
+  if (!exchangesPromise) {
+    exchangesPromise = buildExchanges().catch((err) => {
+      exchangesPromise = null;
+      throw err;
+    });
+  }
+  return exchangesPromise;
+};
 
 // ---------- 余额 ----------
 async function fetchBinanceEquity(ex) {
@@ -586,13 +705,13 @@ async function fetchFundingWindow(exchange, symbol, sinceMs, nowMs) {
 async function fetchBackpackPositions(exchange) {
   const positions = await backpackSignedRequest('api/v1/position', 'positionQuery');
   return (positions || []).map((p) => {
-    const netCost = num(p.netCost);
-    const contracts = Math.abs(num(p.netExposureQuantity || p.netQuantity));
+    const netQuantity = num(p.netQuantity ?? p.netExposureQuantity);
+    const contracts = Math.abs(netQuantity);
     return {
       info: p,
       id: p.positionId,
       symbol: backpackUnifiedSymbol(exchange, p.symbol),
-      side: netCost < 0 ? 'short' : 'long',
+      side: netQuantity < 0 ? 'short' : 'long',
       contracts,
       entryPrice: num(p.entryPrice || p.breakEvenPrice),
       markPrice: num(p.markPrice),
@@ -843,7 +962,7 @@ async function fetchBackpackOpenOrders(exchange) {
     symbol: backpackUnifiedSymbol(exchange, o.symbol),
     side: o.side === 'Bid' ? 'buy' : o.side === 'Ask' ? 'sell' : String(o.side || '').toLowerCase(),
     type: o.orderType,
-    price: num(o.price || o.limitPrice || o.triggerPrice),
+    price: num(o.price || o.limitPrice),
     triggerPrice: num(
       o.triggerPrice ||
       o.stopLossTriggerPrice ||
@@ -891,7 +1010,12 @@ async function processExchangeOrders(name, exchange, positionRows) {
   }
 
   // 过滤无效订单（价格和数量都为 0 → 已成交或无效记录）
-  return results.filter((o) => (o.price > 0 || o.triggerPrice > 0) && o.amount > 0);
+  // Close-all conditional orders can report quantity 0 while retaining a valid trigger price.
+  const supportsZeroQuantityTrigger = ['backpack', 'binance', 'phemex'].includes(name);
+  return results.filter((o) =>
+    (o.price > 0 || o.triggerPrice > 0) &&
+    (o.amount > 0 || (supportsZeroQuantityTrigger && o.triggerPrice > 0))
+  );
 }
 
 function dedupeOrders(orders) {
@@ -1007,14 +1131,18 @@ function analyzeHedges(result) {
 }
 
 // ---------- 主 ----------
-module.exports = async (req, res) => {
+async function buildFundingPayload() {
   const t0 = Date.now();
-  const exchanges = await buildExchanges();
+  const exchanges = await getExchanges();
   const nowMs = Date.now();
   const sinceMs = nowMs - FUNDING_WINDOW_MS;
   const exchangeList = Object.entries(exchanges);
 
   try {
+    const hyperliquidPromise = fetchHyperliquidAccount(nowMs, sinceMs).catch((err) => {
+      console.error(`hyperliquid account: ${err.message}`);
+      return { equity: emptyWallet(), positions: [], orders: [] };
+    });
     const perExchangePromises = exchangeList.map(async ([name, exchange]) => {
       try { await exchange.loadMarkets(); }
       catch (err) { console.error(`❌ ${name} loadMarkets:`, err.message); }
@@ -1029,7 +1157,10 @@ module.exports = async (req, res) => {
       return { name, equity, positions };
     });
 
-    const perExchange = await Promise.all(perExchangePromises);
+    const [perExchange, hyperliquid] = await Promise.all([
+      Promise.all(perExchangePromises),
+      hyperliquidPromise,
+    ]);
 
     const equityOverview = {};
     const result = [];
@@ -1037,6 +1168,8 @@ module.exports = async (req, res) => {
       equityOverview[name] = equity;
       result.push(...positions);
     }
+    equityOverview.hyperliquid = hyperliquid.equity;
+    result.push(...hyperliquid.positions);
 
     const phemexUnrealized = result
       .filter((r) => r.source === 'phemex')
@@ -1051,7 +1184,7 @@ module.exports = async (req, res) => {
       processExchangeOrders(name, exchange, result)
     );
     const ordersPerExchange = await Promise.all(orderPromises);
-    const dedupedOrders = dedupeOrders(ordersPerExchange.flat());
+    const dedupedOrders = dedupeOrders([...ordersPerExchange.flat(), ...hyperliquid.orders]);
 
     const orderIndex = new Map();
     for (const o of dedupedOrders) {
@@ -1085,16 +1218,54 @@ module.exports = async (req, res) => {
       `✅ ${elapsed}ms | pos=${result.length} | noTP=${hedgeHealth.noProtection.length} | fundLoss=${hedgeHealth.fundingLoss.length} | misalign=${hedgeHealth.misaligned.length}`
     );
 
-    res.status(200).json({
+    return {
       success: true,
       result,
       equityOverview,
       totalEquity,
       hedgeHealth,
       elapsedMs: elapsed,
-    });
+    };
   } catch (e) {
     console.error('❌ Error:', e);
-    res.status(500).json({ error: e.message });
+    throw e;
+  }
+}
+
+let fundingResponseCache;
+let fundingResponsePromise;
+
+module.exports = async (req, res) => {
+  const cacheSeconds = Math.max(30, Math.floor(RESPONSE_CACHE_TTL_MS / 1000));
+  res.setHeader(
+    'Cache-Control',
+    `public, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds * 5}`
+  );
+
+  const cacheAgeMs = fundingResponseCache
+    ? Date.now() - fundingResponseCache.storedAt
+    : Infinity;
+  if (fundingResponseCache && cacheAgeMs < RESPONSE_CACHE_TTL_MS) {
+    res.setHeader('X-Funding-Cache', 'HIT');
+    return res.status(200).json(fundingResponseCache.payload);
+  }
+
+  try {
+    if (!fundingResponsePromise) {
+      fundingResponsePromise = buildFundingPayload()
+        .then((payload) => {
+          fundingResponseCache = { storedAt: Date.now(), payload };
+          return payload;
+        })
+        .finally(() => {
+          fundingResponsePromise = null;
+        });
+    }
+
+    const payload = await fundingResponsePromise;
+    res.setHeader('X-Funding-Cache', 'MISS');
+    return res.status(200).json(payload);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
   }
 };
