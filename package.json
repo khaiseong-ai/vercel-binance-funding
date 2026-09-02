@@ -2,9 +2,10 @@
   "name": "vercel-binance-funding",
   "version": "1.0.0",
   "scripts": {
-    "check": "node --check api/funding.js && node --check lib/funding-sheet.js && node --check scripts/funding-sheet.mjs",
+    "check": "node --check api/funding.js && node --check lib/funding-sheet.js && node --check lib/local-dns.js && node --check scripts/funding-sheet.mjs && node --check scripts/local-button-server.mjs",
     "test": "node --test",
-    "snapshot:sheet": "node scripts/funding-sheet.mjs"
+    "snapshot:sheet": "node scripts/funding-sheet.mjs",
+    "button:local": "node scripts/local-button-server.mjs"
   },
   "dependencies": {
     "@noble/curves": "2.2.0",

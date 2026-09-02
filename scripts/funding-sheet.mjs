@@ -10,6 +10,7 @@ const {
   buildFundingSheetSnapshot,
   postFundingSheetSnapshot
 } = require("../lib/funding-sheet.js");
+const { installTrustedDnsLookup } = require("../lib/local-dns.js");
 
 const defaultEnvPath = path.join(os.homedir(), "AppData", "Local", "ks-funding", "funding.env");
 const envPath = process.env.FUNDING_LOCAL_ENV || defaultEnvPath;
@@ -37,7 +38,18 @@ if (!process.env.BITGET_API_PASSWORD && process.env.BITGET_API_PASSPHRASE) {
   process.env.BITGET_API_PASSWORD = process.env.BITGET_API_PASSPHRASE;
 }
 
+await installTrustedDnsLookup();
+const coverageWarnings = [];
+const originalConsoleError = console.error.bind(console);
+console.error = (...values) => {
+  const warning = values.map((value) => String(value)).join(" ").trim();
+  if (warning) coverageWarnings.push(warning);
+  originalConsoleError(...values);
+};
 const payload = await buildFundingPayload();
+if (coverageWarnings.length > 0) {
+  throw new Error(`Funding coverage incomplete: ${coverageWarnings.join("; ")}`);
+}
 assertFundingRelayCoverage(payload);
 const snapshot = buildFundingSheetSnapshot(payload);
 if (snapshot.positions.length === 0 && snapshot.totalEquity === 0) {
