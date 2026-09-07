@@ -56,6 +56,28 @@ test("posts only to an authenticated Apps Script web app", async () => {
   );
 });
 
+test("retries transient Apps Script failures before writing", async () => {
+  const statuses = [404, 429, 200];
+  const delays = [];
+  const fetchImpl = async () => {
+    const status = statuses.shift();
+    return new Response(JSON.stringify({ ok: status === 200, rowsWritten: 4 }), {
+      status,
+      headers: { "content-type": "application/json" }
+    });
+  };
+
+  const result = await postFundingSheetSnapshot({
+    url: "https://script.google.com/macros/s/example/exec",
+    secret: "secret"
+  }, { success: true }, fetchImpl, {
+    sleepImpl: async (delayMs) => delays.push(delayMs)
+  });
+
+  assert.equal(result.rowsWritten, 4);
+  assert.deepEqual(delays, [1000, 2000]);
+});
+
 test("blocks Sheet writes when a requested relay exchange is missing", () => {
   assert.doesNotThrow(() => assertFundingRelayCoverage({
     relayStatus: {
