@@ -273,6 +273,7 @@ function renderFundingOverview_(spreadsheet, snapshot, checkedAt) {
   const requiredRows = Math.max(100, totalsRow + 5);
   if (sheet.getMaxRows() < requiredRows) sheet.insertRowsAfter(sheet.getMaxRows(), requiredRows - sheet.getMaxRows());
   if (sheet.getMaxColumns() < 12) sheet.insertColumnsAfter(sheet.getMaxColumns(), 12 - sheet.getMaxColumns());
+  if (sheet.getFilter()) sheet.getFilter().remove();
   sheet.getDataRange().breakApart();
   sheet.clear();
   sheet.setHiddenGridlines(true);
