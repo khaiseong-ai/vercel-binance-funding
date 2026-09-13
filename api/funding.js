@@ -92,7 +92,7 @@ const cleanSymbol = (s) => {
   let out = String(s).toUpperCase();
   if (out.includes('/')) out = out.split('/')[0];
   else if (out.includes(':')) out = out.split(':').pop();
-  const aliases = { BROCCOLI714: 'BROCCOLI', CL: 'XTI', MONAD: 'MON', PUMPFUN: 'PUMP' };
+  const aliases = { BROCCOLI714: 'BROCCOLI', CL: 'XTI', MONAD: 'MON', PUMPFUN: 'PUMP', '1000LUNC': 'LUNC' };
   return aliases[out] || out;
 };
 
@@ -1468,4 +1468,5 @@ async function fundingHandler(req, res) {
 module.exports = fundingHandler;
 module.exports.buildFundingPayload = buildFundingPayload;
 module.exports.fetchFundingRelay = fetchFundingRelay;
+module.exports.cleanSymbol = cleanSymbol;
 module.exports.buildExpectedFundingRecords = buildExpectedFundingRecords;
