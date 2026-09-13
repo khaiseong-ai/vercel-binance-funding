@@ -96,6 +96,8 @@ const cleanSymbol = (s) => {
   return aliases[out] || out;
 };
 
+const symbolUnitMultiplier = (s) => String(s || '').toUpperCase().includes('1000LUNC') ? 1000 : 1;
+
 async function hyperliquidInfo(body) {
   const response = await fetch(`${HYPERLIQUID_REST_BASE}/info`, {
     method: 'POST',
@@ -1036,7 +1038,8 @@ async function processExchangePositions(name, exchange, nowMs, sinceMs) {
     );
     const totalFunding = allFunding.reduce((s, f) => s + num(f.amount), 0) * signFlip;
 
-    let positionSize = pos.contracts;
+    const unitMultiplier = name === 'binance' ? symbolUnitMultiplier(pos.symbol) : 1;
+    let positionSize = pos.contracts * unitMultiplier;
     if (name === 'mexc' || name === 'bitget') {
       const market = exchange.markets[pos.symbol];
       const contractSize = market?.contractSize || 1;
@@ -1046,12 +1049,12 @@ async function processExchangePositions(name, exchange, nowMs, sinceMs) {
     }
 
     const ticker = tickerCache[pos.symbol];
-    const computed = computePnL(pos, ticker, positionSize);
+    const computed = computePnL(pos, ticker, positionSize / unitMultiplier);
     const unrealizedPnl = name === 'backpack' && Number.isFinite(num(pos.unrealizedPnl))
       ? num(pos.unrealizedPnl)
       : computed.unrealizedPnl;
     const positionValue = computed.positionValue || num(pos.info?.netExposureNotional) || Math.abs(num(pos.info?.netCost));
-    const currentPrice = computed.currentPrice;
+    const currentPrice = computed.currentPrice / unitMultiplier;
     const side = computed.side;
 
     return {
@@ -1060,7 +1063,7 @@ async function processExchangePositions(name, exchange, nowMs, sinceMs) {
       rawSymbol: pos.symbol,
       side,
       currentPrice,
-      entryPrice: pos.entryPrice || pos.entry_price || 0,
+      entryPrice: num(pos.entryPrice || pos.entry_price) / unitMultiplier,
       positionSize,
       positionValue,
       unrealizedPnl,
@@ -1097,6 +1100,7 @@ function formatOrder(o, name, exchange) {
   // MEXC 合约 amount 是张数 (contracts)；需要 × contractSize 转成币数
   // 保持和 position.positionSize 的换算一致（见 processExchangePositions）
   let amount = num(o.amount || o.info?.origQty || o.info?.quantity || 0);
+  const unitMultiplier = name === 'binance' ? symbolUnitMultiplier(o.symbol) : 1;
   if ((name === 'mexc' || name === 'bitget') && exchange && o.symbol) {
     const market = exchange.markets?.[o.symbol];
     const contractSize = market?.contractSize;
@@ -1104,14 +1108,18 @@ function formatOrder(o, name, exchange) {
       amount = amount * contractSize;
     }
   }
+  amount *= unitMultiplier;
+  const normalizedDisplayPrice = displayPrice / unitMultiplier;
+  const normalizedTriggerPrice = triggerPrice / unitMultiplier;
+  const normalizedLimitPrice = limitPrice / unitMultiplier;
 
   return {
     exchange: name,
     symbol: cleanSymbol(o.symbol),
     side: name === 'mexc' ? convertMexcOrderSide(o.side) : o.side,
-    price: displayPrice,
-    triggerPrice,
-    limitPrice,
+    price: normalizedDisplayPrice,
+    triggerPrice: normalizedTriggerPrice,
+    limitPrice: normalizedLimitPrice,
     amount,
     kind,
     orderType,
@@ -1469,4 +1477,5 @@ module.exports = fundingHandler;
 module.exports.buildFundingPayload = buildFundingPayload;
 module.exports.fetchFundingRelay = fetchFundingRelay;
 module.exports.cleanSymbol = cleanSymbol;
+module.exports.symbolUnitMultiplier = symbolUnitMultiplier;
 module.exports.buildExpectedFundingRecords = buildExpectedFundingRecords;
